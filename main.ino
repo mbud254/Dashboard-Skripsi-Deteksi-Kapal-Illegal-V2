@@ -2,7 +2,9 @@
 #include <SPI.h>
 #include <LoRa.h>
 
-// ================= GPS =================
+// =====================================================
+// GPS CONFIG
+// =====================================================
 #define RXD2 16
 #define TXD2 17
 #define GPS_BAUD 9600
@@ -10,21 +12,30 @@
 TinyGPSPlus gps;
 HardwareSerial gpsSerial(2);
 
-// ================= LoRa =================
+// =====================================================
+// LORA CONFIG
+// =====================================================
 #define SS_PIN   5
 #define RST_PIN  14
 #define DIO0_PIN 26
 
-// ================= Shared Variables =================
-volatile bool gpsReady = false;
+// =====================================================
+// SHARED VARIABLES
+// =====================================================
+volatile bool gpsReady  = false;
 volatile bool loraReady = false;
-volatile bool gpsFix = false;
+volatile bool gpsFix    = false;
 
-float latitude = 0.0;
+float latitude  = 0.0;
 float longitude = 0.0;
-int satellites = 0;
 
-// ================= TASK GPS =================
+int satellites = 0;
+float hdopValue = 0.0;
+uint32_t gpsChars = 0;
+
+// =====================================================
+// GPS TASK
+// =====================================================
 void TaskGPS(void *pvParameters)
 {
   Serial.println("[GPS] Task Started");
@@ -33,30 +44,50 @@ void TaskGPS(void *pvParameters)
   {
     while (gpsSerial.available())
     {
-      gps.encode(gpsSerial.read());
+      char c = gpsSerial.read();
+
+      gps.encode(c);
+
+      // tampilkan raw NMEA sebelum fix
+      if (!gpsFix)
+      {
+        Serial.write(c);
+      }
     }
+
+    gpsChars = gps.charsProcessed();
+
+    if (gps.satellites.isValid())
+      satellites = gps.satellites.value();
+
+    if (gps.hdop.isValid())
+      hdopValue = gps.hdop.hdop();
 
     if (gps.location.isValid())
     {
       latitude = gps.location.lat();
       longitude = gps.location.lng();
-      satellites = gps.satellites.value();
-
       gpsFix = true;
+    }
+    else
+    {
+      gpsFix = false;
     }
 
     vTaskDelay(pdMS_TO_TICKS(10));
   }
 }
 
-// ================= TASK LORA =================
+// =====================================================
+// LORA TX TASK
+// =====================================================
 void TaskLoRa(void *pvParameters)
 {
   Serial.println("[LORA] Task Started");
 
   for (;;)
   {
-    if (gpsReady && loraReady && gpsFix)
+    if (gpsFix && loraReady)
     {
       String payload =
           "LAT=" + String(latitude, 6) +
@@ -65,10 +96,17 @@ void TaskLoRa(void *pvParameters)
 
       LoRa.beginPacket();
       LoRa.print(payload);
-      LoRa.endPacket();
 
-      Serial.println("[LORA TX]");
+      int result = LoRa.endPacket();
+
+      Serial.println();
+      Serial.println("========== LORA TX ==========");
       Serial.println(payload);
+
+      Serial.print("TX Result : ");
+      Serial.println(result);
+
+      Serial.println("=============================");
       Serial.println();
 
       vTaskDelay(pdMS_TO_TICKS(5000));
@@ -80,32 +118,52 @@ void TaskLoRa(void *pvParameters)
   }
 }
 
-// ================= TASK MONITOR =================
+// =====================================================
+// MONITOR TASK
+// =====================================================
 void TaskMonitor(void *pvParameters)
 {
   for (;;)
   {
+    Serial.println();
     Serial.println("========== STATUS ==========");
 
-    Serial.print("GPS Init : ");
+    Serial.print("GPS Init   : ");
     Serial.println(gpsReady ? "OK" : "FAIL");
 
-    Serial.print("LoRa Init: ");
+    Serial.print("LoRa Init  : ");
     Serial.println(loraReady ? "OK" : "FAIL");
 
-    Serial.print("GPS Fix  : ");
+    Serial.print("GPS Fix    : ");
     Serial.println(gpsFix ? "YES" : "NO");
+
+    Serial.print("GPS Chars  : ");
+    Serial.println(gpsChars);
+
+    Serial.print("Satellites : ");
+    Serial.println(satellites);
+
+    Serial.print("HDOP       : ");
+    Serial.println(hdopValue);
 
     if (gpsFix)
     {
-      Serial.print("LAT : ");
+      Serial.print("Latitude   : ");
       Serial.println(latitude, 6);
 
-      Serial.print("LON : ");
+      Serial.print("Longitude  : ");
       Serial.println(longitude, 6);
+    }
+    else
+    {
+      Serial.println("Latitude   : ---");
+      Serial.println("Longitude  : ---");
+    }
 
-      Serial.print("SAT : ");
-      Serial.println(satellites);
+    if (millis() > 15000 && gpsChars < 10)
+    {
+      Serial.println();
+      Serial.println("[ERROR] GPS NOT DETECTED!");
     }
 
     Serial.println("============================");
@@ -115,16 +173,76 @@ void TaskMonitor(void *pvParameters)
   }
 }
 
+// =====================================================
+// LORA INIT FUNCTION
+// =====================================================
+bool initLoRa()
+{
+  Serial.println();
+  Serial.println("[INIT] LoRa Start");
+
+  // Hardware Reset SX1278
+  pinMode(RST_PIN, OUTPUT);
+
+  digitalWrite(RST_PIN, LOW);
+  delay(20);
+
+  digitalWrite(RST_PIN, HIGH);
+  delay(100);
+
+  LoRa.setPins(
+      SS_PIN,
+      RST_PIN,
+      DIO0_PIN);
+
+  int retry = 0;
+
+  while (!LoRa.begin(433E6))
+  {
+    retry++;
+
+    Serial.print("[INIT] LoRa init failed... Attempt ");
+    Serial.println(retry);
+
+    delay(1000);
+
+    digitalWrite(RST_PIN, LOW);
+    delay(20);
+    digitalWrite(RST_PIN, HIGH);
+    delay(100);
+
+    if (retry >= 10)
+    {
+      Serial.println("[INIT] LoRa Gave Up");
+      return false;
+    }
+  }
+
+  LoRa.setSyncWord(0xF3);
+  LoRa.setTxPower(17);
+
+  Serial.println("[INIT] LoRa OK");
+
+  return true;
+}
+
+// =====================================================
+// SETUP
+// =====================================================
 void setup()
 {
   Serial.begin(115200);
+
   delay(1000);
 
+  Serial.println();
   Serial.println("=================================");
   Serial.println(" GPS + LoRa RTOS Tracker ");
   Serial.println("=================================");
 
-  // ================= GPS INIT =================
+  // =================================================
+  // GPS INIT
+  // =================================================
 
   gpsSerial.begin(
       GPS_BAUD,
@@ -136,30 +254,18 @@ void setup()
 
   Serial.println("[INIT] GPS OK");
 
-  // ================= LORA INIT =================
+  // beri waktu GPS stabil
+  delay(1000);
 
-  SPI.begin(18, 19, 23, 5);
+  // =================================================
+  // LORA INIT
+  // =================================================
 
-  LoRa.setPins(
-      SS_PIN,
-      RST_PIN,
-      DIO0_PIN);
+  loraReady = initLoRa();
 
-  if (LoRa.begin(433E6))
-  {
-    LoRa.setSyncWord(0xF3);
-    LoRa.setTxPower(17);
-
-    loraReady = true;
-
-    Serial.println("[INIT] LoRa OK");
-  }
-  else
-  {
-    Serial.println("[INIT] LoRa FAILED");
-  }
-
-  // ================= TASKS =================
+  // =================================================
+  // CREATE TASKS
+  // =================================================
 
   xTaskCreatePinnedToCore(
       TaskGPS,
@@ -189,6 +295,9 @@ void setup()
       0);
 }
 
+// =====================================================
+// LOOP
+// =====================================================
 void loop()
 {
   vTaskDelete(NULL);
