@@ -31,7 +31,7 @@ import { cn } from "@/lib/utils";
 
 // ——— Types & constants ———
 
-type MonitoringStatus = "AMAN" | "INDIKASI KAPAL" | "ILLEGAL FISHING DETECTED";
+type MonitoringStatus = "SAFE" | "ILLEGAL VESSEL DETECTED";
 
 interface SplPoint {
   time: string;
@@ -54,9 +54,16 @@ interface FftBand {
 const FFT_FREQUENCIES = [50, 100, 150, 200, 250, 300, 350, 400, 450, 500];
 const FFT_ENERGY_THRESHOLD = 72;
 const MAX_HISTORY = 36;
-const EMA_ALPHA = 0.25;
 
 const GPS_COORDS = { lat: -6.123, lng: 106.456 };
+
+interface SensorApiResponse {
+  spl: number | null;
+  fft: number | null;
+  ema: number | null;
+  status: MonitoringStatus | null;
+  updatedAt: number | null;
+}
 
 // ——— Helpers ———
 
@@ -68,67 +75,22 @@ function formatTime(date: Date): string {
   });
 }
 
-function computeEma(current: number, previousEma: number): number {
-  return EMA_ALPHA * current + (1 - EMA_ALPHA) * previousEma;
-}
-
-function evaluateStatus(
-  spl: number,
-  fftBands: FftBand[]
-): MonitoringStatus {
-  const lowFreqSpike = fftBands
-    .filter((b) => b.hz <= 200)
-    .some((b) => b.energy > FFT_ENERGY_THRESHOLD);
-
-  if (spl >= 78 && lowFreqSpike) {
-    return "ILLEGAL FISHING DETECTED";
-  }
-  if (spl >= 62 || lowFreqSpike) {
-    return "INDIKASI KAPAL";
-  }
-  return "AMAN";
-}
-
 function statusVariant(
   status: MonitoringStatus
 ): "safe" | "warning" | "danger" {
-  switch (status) {
-    case "AMAN":
-      return "safe";
-    case "INDIKASI KAPAL":
-      return "warning";
-    case "ILLEGAL FISHING DETECTED":
-      return "danger";
-  }
+  return status === "ILLEGAL VESSEL DETECTED" ? "danger" : "safe";
 }
 
-function clamp(value: number, min: number, max: number): number {
-  return Math.min(max, Math.max(min, value));
+function formatValue(value: number | null, decimals = 1): string {
+  return value === null ? "—" : value.toFixed(decimals);
 }
 
-// Simulates boat approach: SPL rises, low-frequency FFT energy grows over ticks
-function generateMockSnapshot(tick: number) {
-  const approach = Math.min(1, tick / 45);
-  const noise = () => (Math.random() - 0.5) * 2;
-
-  const spl = clamp(48 + approach * 38 + noise() * 3, 42, 92);
-  const rssi = clamp(-88 + approach * 10 + noise() * 2, -95, -68);
-  const snr = clamp(6 + approach * 6 + noise(), 4, 14);
-  const pdr = clamp(97 - approach * 4 + noise() * 0.5, 88, 99.5);
-  const battery = clamp(87 - tick * 0.02, 62, 100);
-
-  const fftBands: FftBand[] = FFT_FREQUENCIES.map((hz) => {
-    const lowFreqBoost = hz <= 200 ? (1 - hz / 250) * approach * 55 : 0;
-    const base = 18 + Math.random() * 12;
-    const energy = clamp(base + lowFreqBoost + noise() * 4, 5, 98);
-    return {
-      frequency: `${hz}Hz`,
-      energy: Math.round(energy * 10) / 10,
-      hz,
-    };
-  });
-
-  return { spl, rssi, snr, pdr, battery, fftBands };
+function buildFftBands(fftEnergy: number): FftBand[] {
+  return FFT_FREQUENCIES.map((hz) => ({
+    frequency: `${hz}Hz`,
+    energy: Math.round(fftEnergy * 10) / 10,
+    hz,
+  }));
 }
 
 // ——— Sub-components ———
@@ -182,15 +144,17 @@ function SummaryCard({
   );
 }
 
-function BatteryIndicator({ percent }: { percent: number }) {
+function BatteryIndicator({ percent }: { percent: number | null }) {
   const level =
-    percent > 60 ? "high" : percent > 30 ? "mid" : "low";
+    percent === null ? "mid" : percent > 60 ? "high" : percent > 30 ? "mid" : "low";
   const color =
-    level === "high"
-      ? "text-emerald-400"
-      : level === "mid"
-        ? "text-amber-400"
-        : "text-red-400";
+    percent === null
+      ? "text-slate-500"
+      : level === "high"
+        ? "text-emerald-400"
+        : level === "mid"
+          ? "text-amber-400"
+          : "text-red-400";
 
   return (
     <div className="flex items-center gap-3 rounded-lg border border-cyan-900/40 bg-slate-900/80 px-4 py-2">
@@ -200,7 +164,7 @@ function BatteryIndicator({ percent }: { percent: number }) {
           Baterai Pelampung
         </p>
         <p className={cn("font-mono text-lg font-bold tabular-nums", color)}>
-          {percent.toFixed(1)}%
+          {formatValue(percent)}%
         </p>
       </div>
       <div className="ml-2 h-2 w-24 overflow-hidden rounded-full bg-slate-800">
@@ -211,7 +175,7 @@ function BatteryIndicator({ percent }: { percent: number }) {
             level === "mid" && "bg-amber-500",
             level === "low" && "bg-red-500"
           )}
-          style={{ width: `${percent}%` }}
+          style={{ width: `${percent ?? 0}%` }}
         />
       </div>
     </div>
@@ -231,75 +195,71 @@ const chartTooltipStyle = {
 // ——— Main page ———
 
 export default function DashboardPage() {
-  const tickRef = useRef(0);
-  const emaRef = useRef(50);
+  const lastUpdatedAtRef = useRef<number | null>(null);
 
-  const [status, setStatus] = useState<MonitoringStatus>("AMAN");
-  const [spl, setSpl] = useState(50);
-  const [rssi, setRssi] = useState(-85);
-  const [snr, setSnr] = useState(8);
-  const [pdr, setPdr] = useState(98);
-  const [battery, setBattery] = useState(87);
+  const [status, setStatus] = useState<MonitoringStatus>("SAFE");
+  const [spl, setSpl] = useState<number | null>(null);
   const [splHistory, setSplHistory] = useState<SplPoint[]>([]);
-  const [loraHistory, setLoraHistory] = useState<LoraPoint[]>([]);
-  const [fftBands, setFftBands] = useState<FftBand[]>(() =>
-    FFT_FREQUENCIES.map((hz) => ({
-      frequency: `${hz}Hz`,
-      energy: 25,
-      hz,
-    }))
-  );
+  const [fftBands, setFftBands] = useState<FftBand[]>([]);
   const [lastUpdate, setLastUpdate] = useState<string>("—");
 
+  const rssi: number | null = null;
+  const snr: number | null = null;
+  const pdr: number | null = null;
+  const battery: number | null = null;
+  const loraHistory: LoraPoint[] = [];
+
   useEffect(() => {
-    const pushData = () => {
-      tickRef.current += 1;
-      const tick = tickRef.current;
-      const now = new Date();
-      const timeLabel = formatTime(now);
+    const fetchSensorData = async () => {
+      try {
+        const response = await fetch("/api/sensor");
+        if (!response.ok) return;
 
-      const mock = generateMockSnapshot(tick);
-      const newEma = computeEma(mock.spl, emaRef.current);
-      emaRef.current = newEma;
+        const data: SensorApiResponse = await response.json();
+        if (
+          data.spl === null ||
+          data.fft === null ||
+          data.ema === null ||
+          data.status === null ||
+          data.updatedAt === null
+        ) {
+          return;
+        }
 
-      setSpl(Math.round(mock.spl * 10) / 10);
-      setRssi(Math.round(mock.rssi * 10) / 10);
-      setSnr(Math.round(mock.snr * 10) / 10);
-      setPdr(Math.round(mock.pdr * 10) / 10);
-      setBattery(Math.round(mock.battery * 10) / 10);
-      setFftBands(mock.fftBands);
-      setStatus(evaluateStatus(mock.spl, mock.fftBands));
-      setLastUpdate(timeLabel);
+        const bands = buildFftBands(data.fft);
 
-      setSplHistory((prev) => {
-        const next = [
-          ...prev,
-          { time: timeLabel, spl: mock.spl, ema: newEma },
-        ];
-        return next.slice(-MAX_HISTORY);
-      });
+        setSpl(Math.round(data.spl * 10) / 10);
+        setFftBands(bands);
+        setStatus(data.status);
 
-      setLoraHistory((prev) => {
-        const next = [
-          ...prev,
-          { time: timeLabel, rssi: mock.rssi, snr: mock.snr },
-        ];
-        return next.slice(-MAX_HISTORY);
-      });
+        if (data.updatedAt !== lastUpdatedAtRef.current) {
+          lastUpdatedAtRef.current = data.updatedAt;
+          const timeLabel = formatTime(new Date(data.updatedAt));
+          setLastUpdate(timeLabel);
+
+          setSplHistory((prev) => {
+            const next = [
+              ...prev,
+              { time: timeLabel, spl: data.spl!, ema: data.ema! },
+            ];
+            return next.slice(-MAX_HISTORY);
+          });
+        }
+      } catch {
+        // Ignore transient network errors during polling
+      }
     };
 
-    pushData();
-    const interval = setInterval(pushData, 2000);
+    fetchSensorData();
+    const interval = setInterval(fetchSensorData, 1000);
     return () => clearInterval(interval);
   }, []);
 
   const statusIcon = useMemo(() => {
     switch (status) {
-      case "AMAN":
+      case "SAFE":
         return <Anchor className="h-4 w-4" />;
-      case "INDIKASI KAPAL":
-        return <Activity className="h-4 w-4" />;
-      case "ILLEGAL FISHING DETECTED":
+      case "ILLEGAL VESSEL DETECTED":
         return <Waves className="h-4 w-4" />;
     }
   }, [status]);
@@ -321,7 +281,7 @@ export default function DashboardPage() {
                 Sistem Pemantauan Akustik Illegal Fishing (LoRa & ESP32)
               </h1>
               <p className="mt-1 font-mono text-xs text-slate-500">
-                Pembaruan terakhir: {lastUpdate} · Interval 2s (mock)
+                Pembaruan terakhir: {lastUpdate} · Interval 1s (ESP32)
               </p>
             </div>
           </div>
@@ -342,28 +302,28 @@ export default function DashboardPage() {
         <section className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
           <SummaryCard
             title="Rata-rata SPL"
-            value={spl.toFixed(1)}
+            value={formatValue(spl)}
             unit="dB"
             icon={Volume2}
             accent="cyan"
           />
           <SummaryCard
             title="RSSI LoRa"
-            value={rssi.toFixed(1)}
+            value={formatValue(rssi)}
             unit="dBm"
             icon={Signal}
             accent="violet"
           />
           <SummaryCard
             title="SNR LoRa"
-            value={snr.toFixed(1)}
+            value={formatValue(snr)}
             unit="dB"
             icon={Wifi}
             accent="emerald"
           />
           <SummaryCard
             title="Packet Delivery Ratio"
-            value={pdr.toFixed(1)}
+            value={formatValue(pdr)}
             unit="%"
             icon={Radio}
             accent="amber"
@@ -401,7 +361,7 @@ export default function DashboardPage() {
                       interval="preserveStartEnd"
                     />
                     <YAxis
-                      domain={[40, 100]}
+                      domain={["auto", "auto"]}
                       tick={{ fill: "#64748b", fontSize: 11 }}
                       tickLine={false}
                       axisLine={{ stroke: "rgba(6, 182, 212, 0.2)" }}
@@ -448,8 +408,8 @@ export default function DashboardPage() {
                 FFT Frequency Energy
               </CardTitle>
               <p className="text-xs text-slate-500">
-                Band 50–500 Hz · merah jika energi &gt; {FFT_ENERGY_THRESHOLD}{" "}
-                (signature mesin/propeller)
+                Wide-band 50–2000 Hz · deteksi signature mesin/propeller hingga
+                2 kHz · merah jika energi &gt; {FFT_ENERGY_THRESHOLD}
               </p>
             </CardHeader>
             <CardContent>
@@ -471,7 +431,7 @@ export default function DashboardPage() {
                       axisLine={{ stroke: "rgba(6, 182, 212, 0.2)" }}
                     />
                     <YAxis
-                      domain={[0, 100]}
+                      domain={["auto", "auto"]}
                       tick={{ fill: "#64748b", fontSize: 11 }}
                       tickLine={false}
                       axisLine={{ stroke: "rgba(6, 182, 212, 0.2)" }}
@@ -636,8 +596,7 @@ export default function DashboardPage() {
         </section>
 
         <footer className="border-t border-cyan-900/20 pt-4 text-center text-xs text-slate-600">
-          Dashboard Skripsi · Smart Buoy Acoustic Monitoring · Mock data ESP32 /
-          LoRa
+          Dashboard Skripsi · Smart Buoy Acoustic Monitoring · ESP32 live data
         </footer>
       </div>
     </div>
